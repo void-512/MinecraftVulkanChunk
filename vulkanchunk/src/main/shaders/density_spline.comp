@@ -1,0 +1,91 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer { uint words[]; } inputData;
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuffer { uint values[]; } outputData;
+layout(push_constant) uniform Parameters { uint count; int unused0; int unused1; int unused2; } params;
+
+uint inputBase() { return params.unused2 < 0
+    ? inputData.words[uint(params.unused1) + gl_WorkGroupID.y * 4u]
+    : 0u; }
+uint outputBase() { return params.unused2 < 0
+    ? inputData.words[uint(params.unused1) + gl_WorkGroupID.y * 4u + 1u]
+    : 0u; }
+
+float lerpValue(float t, float a, float b) {
+    precise float difference = b - a;
+    precise float product = t * difference;
+    return a + product;
+}
+
+void main() {
+    uint sampleIndex = gl_GlobalInvocationID.x;
+    uint baseAddress = inputBase();
+    if (sampleIndex >= inputData.words[baseAddress]) return;
+    uint nodeCount = inputData.words[baseAddress + 1u];
+    uint coordinateCount = inputData.words[baseAddress + 3u];
+    uint nodeOffset = baseAddress + inputData.words[baseAddress + 4u];
+    uint pointOffset = baseAddress + inputData.words[baseAddress + 5u];
+    uint sampleOffset = baseAddress + inputData.words[baseAddress + 6u] + sampleIndex * coordinateCount;
+    uint sourceTable = baseAddress + inputData.words[baseAddress + 6u]
+        + inputData.words[baseAddress] * coordinateCount;
+    float stack[512];
+    uint branchHash = 2166136261u;
+    for (uint n = 0u; n < nodeCount; n++) {
+        uint base = nodeOffset + n * 5u;
+        uint pointCount = inputData.words[base + 3u];
+        if (pointCount == 0u) {
+            stack[n] = uintBitsToFloat(inputData.words[base + 4u]);
+            continue;
+        }
+        uint coordinateIndex = inputData.words[base + 1u];
+        float coordinate = uintBitsToFloat(inputData.words[sampleOffset + coordinateIndex]);
+        if (params.unused2 < 0) {
+            uint source = inputData.words[sourceTable + coordinateIndex * 2u];
+            if (source != 0u) {
+                uint address = source - 1u + sampleIndex * inputData.words[sourceTable + coordinateIndex * 2u + 1u];
+                coordinate = uintBitsToFloat(inputData.words[address])
+                    + uintBitsToFloat(inputData.words[address + 1u]);
+            }
+        }
+        uint pointStart = inputData.words[base + 2u];
+        int interval = -1;
+        for (uint j = 0u; j < pointCount; j++) {
+            float location = uintBitsToFloat(inputData.words[pointOffset + (pointStart + j) * 3u]);
+            if (coordinate >= location) interval = int(j);
+            else break;
+        }
+        if (params.unused2 != -2) branchHash = (branchHash ^ uint(interval + 1)) * 16777619u;
+        uint selected = pointStart + uint(max(interval, 0));
+        uint a = pointOffset + selected * 3u;
+        float x0 = uintBitsToFloat(inputData.words[a]);
+        float slope0 = uintBitsToFloat(inputData.words[a + 1u]);
+        float low = stack[inputData.words[a + 2u]];
+        if (interval < 0 || interval == int(pointCount) - 1) {
+            if (slope0 == 0.0) stack[n] = low;
+            else {
+                precise float delta = coordinate - x0;
+                precise float product = slope0 * delta;
+                stack[n] = low + product;
+            }
+        } else {
+            uint b = a + 3u;
+            float x1 = uintBitsToFloat(inputData.words[b]);
+            float slope1 = uintBitsToFloat(inputData.words[b + 1u]);
+            float high = stack[inputData.words[b + 2u]];
+            precise float width = x1 - x0;
+            precise float t = (coordinate - x0) / width;
+            precise float height = high - low;
+            precise float m0 = slope0 * width - height;
+            precise float m1 = -slope1 * width + height;
+            precise float blend = t * (1.0 - t);
+            precise float correction = blend * lerpValue(t, m0, m1);
+            stack[n] = lerpValue(t, low, high) + correction;
+        }
+    }
+    uint stride = params.unused2 < 0 ? 3u : 2u;
+    uint target = outputBase() + sampleIndex * stride;
+    outputData.values[target] = floatBitsToUint(stack[nodeCount - 1u]);
+    if (params.unused2 < 0) outputData.values[target + 1u] = 0u;
+    outputData.values[target + stride - 1u] = params.unused2 == -2 ? 0u : branchHash;
+}

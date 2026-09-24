@@ -1,0 +1,7 @@
+# Precision constraints
+
+Minecraft terrain noise uses Java `double`. Plain FP32 changed cave-noise lattice cells and final-density signs at distant coordinates. The production shaders therefore preserve the validated selective double-single path, including split-product multiplication, exact decomposition of large integer coordinates, precise coordinate wrapping and octave scaling, mode-2-style inner noise arithmetic, and the BlendedNoise vertical-smear quotient correction. Avoid replacing those operations with plain FP32 without a new decision-level regression.
+
+On the Raspberry Pi V3DV driver, relying on GLSL `fma` for the product residual lost a nonzero residual; split-product arithmetic fixed the observed near-border cell error. Large signed coordinates are decomposed into exactly convertible pieces before scaling. The graph, spline, and final-density stages consume high/low pairs where required by the validated path.
+
+The staged research comparison found zero observed branch, sign, aquifer, material, and noise-fill block mismatches across ordinary, negative, distant, near-border, and water/lava terrain samples. Prompt 12's 16-chunk negative-coordinate run compared 1,572,864 block positions with 98,597 water and 18 lava aquifer outcomes and found zero block mismatches. These are finite tests, not a proof of universal bit identity. The production opt-in actual-chunk validator provides a direct regression check after integration.

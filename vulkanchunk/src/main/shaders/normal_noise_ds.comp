@@ -1,0 +1,452 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer { uint words[]; } inputData;
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuffer { uint values[]; } outputData;
+layout(push_constant) uniform Parameters { uint count; int mode; int unused1; int unused2; } params;
+
+uint jobInputBase;
+uint jobOutputBase;
+int jobNoiseType;
+uint readWord(uint offset) { return inputData.words[jobInputBase + offset]; }
+uint outputBase() { return jobOutputBase; }
+int noiseType() { return jobNoiseType; }
+
+struct DS { float hi; float lo; };
+
+const ivec3 GRADIENTS[16] = ivec3[](
+    ivec3(1,1,0), ivec3(-1,1,0), ivec3(1,-1,0), ivec3(-1,-1,0),
+    ivec3(1,0,1), ivec3(-1,0,1), ivec3(1,0,-1), ivec3(-1,0,-1),
+    ivec3(0,1,1), ivec3(0,-1,1), ivec3(0,1,-1), ivec3(0,-1,-1),
+    ivec3(1,1,0), ivec3(0,-1,1), ivec3(-1,1,0), ivec3(0,-1,-1)
+);
+
+DS makeDS(float hi, float lo) { return DS(hi, lo); }
+DS scalar(float value) { return DS(value, 0.0); }
+DS readDS(uint offset) {
+    return DS(uintBitsToFloat(readWord(offset)), uintBitsToFloat(readWord(offset + 1u)));
+}
+DS fromInt(int value) {
+    // Convert exactly in pieces: V3DV loses the residual in value - int(float(value)).
+    precise float large = float(value & ~255);
+    precise float small = float(value & 255);
+    precise float hi = large + small;
+    precise float back = hi - large;
+    precise float lo = (large - (hi - back)) + (small - back);
+    return DS(hi, lo);
+}
+DS negate(DS value) { return DS(-value.hi, -value.lo); }
+DS addDS(DS a, DS b) {
+    precise float sum = a.hi + b.hi;
+    precise float back = sum - a.hi;
+    precise float error = (a.hi - (sum - back)) + (b.hi - back);
+    precise float tail = (error + a.lo) + b.lo;
+    precise float hi = sum + tail;
+    precise float lo = tail - (hi - sum);
+    return DS(hi, lo);
+}
+DS subDS(DS a, DS b) { return addDS(a, negate(b)); }
+bool lessDS(DS a, DS b) { return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo); }
+DS minDS(DS a, DS b) { return lessDS(a, b) ? a : b; }
+DS maxDS(DS a, DS b) { return lessDS(a, b) ? b : a; }
+DS mulDS(DS a, DS b) {
+    precise float product = a.hi * b.hi;
+    // V3DV does not retain the fused product residual for fma(a, b, -product).
+    precise float splitA = 4097.0 * a.hi;
+    precise float largeA = splitA - (splitA - a.hi);
+    precise float smallA = a.hi - largeA;
+    precise float splitB = 4097.0 * b.hi;
+    precise float largeB = splitB - (splitB - b.hi);
+    precise float smallB = b.hi - largeB;
+    precise float error = ((largeA * largeB - product) + largeA * smallB)
+                        + smallA * largeB + smallA * smallB;
+    precise float tail = ((error + (a.hi * b.lo + a.lo * b.hi)) + a.lo * b.lo);
+    precise float hi = product + tail;
+    precise float lo = tail - (hi - product);
+    return DS(hi, lo);
+}
+int floorDS(DS value) {
+    int cell = int(floor(value.hi));
+    return value.lo < float(cell) - value.hi ? cell - 1 : cell;
+}
+DS wrapDS(DS value) {
+    int turns = floorDS(addDS(mulDS(value, scalar(1.0 / 33554432.0)), scalar(0.5)));
+    return subDS(value, mulDS(fromInt(turns), scalar(33554432.0)));
+}
+
+float lerpFloat(float t, float a, float b) { return a + t * (b - a); }
+float fadeFloat(float v) { return v * v * v * (v * (v * 6.0 - 15.0) + 10.0); }
+DS lerpDS(DS t, DS a, DS b) { return addDS(a, mulDS(t, subDS(b, a))); }
+DS fadeDS(DS v) {
+    return mulDS(mulDS(mulDS(v, v), v),
+        addDS(mulDS(v, subDS(mulDS(v, scalar(6.0)), scalar(15.0))), scalar(10.0)));
+}
+uint permutation(uint record, int index) {
+    uint normalized = uint(index) & 255u;
+    uint packed = readWord(record + 10u + (normalized >> 2u));
+    return (packed >> ((normalized & 3u) * 8u)) & 255u;
+}
+float gradientFloat(uint hash, float x, float y, float z) {
+    return dot(vec3(GRADIENTS[hash & 15u]), vec3(x,y,z));
+}
+DS signedDS(DS value, int sign) {
+    return sign == -1 ? negate(value) : sign == 0 ? scalar(0.0) : value;
+}
+DS gradientDS(uint hash, DS x, DS y, DS z) {
+    ivec3 g = GRADIENTS[hash & 15u];
+    return addDS(addDS(signedDS(x, g.x), signedDS(y, g.y)), signedDS(z, g.z));
+}
+
+uint endPermutation(int index) {
+    uint normalized = uint(index) & 255u;
+    uint packed = readWord(readWord(3u) + (normalized >> 2u));
+    return (packed >> ((normalized & 3u) * 8u)) & 255u;
+}
+
+DS simplexCorner(uint gradient, DS x, DS y) {
+    DS radius = subDS(subDS(scalar(0.5), mulDS(x, x)), mulDS(y, y));
+    if (lessDS(radius, scalar(0.0))) return scalar(0.0);
+    DS square = mulDS(radius, radius);
+    return mulDS(mulDS(square, square), gradientDS(gradient, x, y, scalar(0.0)));
+}
+
+DS endSimplex(int x, int y) {
+    DS f2 = readDS(4u), g2 = readDS(6u);
+    DS skew = mulDS(fromInt(x + y), f2);
+    int i = floorDS(addDS(fromInt(x), skew));
+    int j = floorDS(addDS(fromInt(y), skew));
+    DS unskew = mulDS(fromInt(i + j), g2);
+    DS dx = subDS(subDS(fromInt(x), fromInt(i)), negate(unskew));
+    DS dy = subDS(subDS(fromInt(y), fromInt(j)), negate(unskew));
+    int stepX = lessDS(dy, dx) ? 1 : 0;
+    int stepY = 1 - stepX;
+    DS dx1 = addDS(subDS(dx, fromInt(stepX)), g2);
+    DS dy1 = addDS(subDS(dy, fromInt(stepY)), g2);
+    DS twoG = mulDS(g2, scalar(2.0));
+    DS dx2 = addDS(subDS(dx, scalar(1.0)), twoG);
+    DS dy2 = addDS(subDS(dy, scalar(1.0)), twoG);
+    uint a = endPermutation(i + int(endPermutation(j))) % 12u;
+    uint b = endPermutation(i + stepX + int(endPermutation(j + stepY))) % 12u;
+    uint c = endPermutation(i + 1 + int(endPermutation(j + 1))) % 12u;
+    return mulDS(scalar(70.0), addDS(addDS(simplexCorner(a, dx, dy),
+            simplexCorner(b, dx1, dy1)), simplexCorner(c, dx2, dy2)));
+}
+
+uint floatIntegerMod13(float value) {
+    if (value < 1.0) return 0u;
+    uint bits = floatBitsToUint(value);
+    uint mantissa = (bits & 0x7fffffu) | 0x800000u;
+    int shift = int((bits >> 23u) & 255u) - 150;
+    if (shift < 0) return (mantissa >> uint(-shift)) % 13u;
+    uint remainder = mantissa % 13u;
+    for (int i = 0; i < shift; i++) remainder = (remainder * 2u) % 13u;
+    return remainder;
+}
+
+float roundedJavaSqrt(int squared) {
+    if (squared <= 0) return squared == 0 ? 0.0 : uintBitsToFloat(0x7fc00000u);
+    float approximate = sqrt(float(squared));
+    uint bits = floatBitsToUint(approximate);
+    DS target = fromInt(squared);
+    DS current = scalar(approximate);
+    if (lessDS(mulDS(current, current), target)) {
+        float next = uintBitsToFloat(bits + 1u);
+        DS middle = mulDS(addDS(current, scalar(next)), scalar(0.5));
+        if (lessDS(mulDS(middle, middle), target)) return next;
+    } else {
+        float previous = uintBitsToFloat(bits - 1u);
+        DS middle = mulDS(addDS(current, scalar(previous)), scalar(0.5));
+        if (lessDS(target, mulDS(middle, middle))) return previous;
+    }
+    return approximate;
+}
+
+DS endIslandValue(uint sampleIndex) {
+    uint at = readWord(2u) + sampleIndex * 2u;
+    int x = int(readWord(at)) / 8, z = int(readWord(at + 1u)) / 8;
+    int i = x / 2, j = z / 2;
+    // V3DV lowers signed modulo with floor semantics; Java uses truncating remainder.
+    int k = x - i * 2, l = z - j * 2;
+    int distanceSquared = int(uint(x) * uint(x) + uint(z) * uint(z));
+    // Java's signed 32-bit square sum can overflow negative; sqrt and all later maxes then stay NaN.
+    if (distanceSquared < 0) return scalar(uintBitsToFloat(0x7fc00000u));
+    precise float base = 100.0 - roundedJavaSqrt(distanceSquared) * 8.0;
+    float height = clamp(base, -100.0, 80.0);
+    for (int di = -12; di <= 12; di++) {
+        for (int dj = -12; dj <= 12; dj++) {
+            int cx = i + di, cz = j + dj;
+            // Java uses 64-bit island distance. Values outside [-64,64] are always distant.
+            if (abs(cx) <= 64 && abs(cz) <= 64 && cx * cx + cz * cz <= 4096) continue;
+            if (!lessDS(endSimplex(cx, cz), readDS(8u))) continue;
+            precise float first = abs(float(cx)) * 3439.0;
+            precise float second = abs(float(cz)) * 147.0;
+            precise float combined = first + second;
+            float scale = float(floatIntegerMod13(combined)) + 9.0;
+            float dx = float(k - di * 2), dz = float(l - dj * 2);
+            precise float candidate = 100.0 - roundedJavaSqrt(int(dx * dx + dz * dz)) * scale;
+            height = max(height, clamp(candidate, -100.0, 80.0));
+        }
+    }
+    return scalar((height - 8.0) / 128.0);
+}
+
+DS improvedNoiseSmear(uint record, DS x, DS y, DS z, DS ySmear, DS yMax, inout uint latticeHash) {
+    DS ox = addDS(x, readDS(record + 4u));
+    DS oy = addDS(y, readDS(record + 6u));
+    DS oz = addDS(z, readDS(record + 8u));
+    int ix = floorDS(ox), iy = floorDS(oy), iz = floorDS(oz);
+    latticeHash = (latticeHash ^ uint(ix)) * 16777619u;
+    latticeHash = (latticeHash ^ uint(iy)) * 16777619u;
+    latticeHash = (latticeHash ^ uint(iz)) * 16777619u;
+    DS lx = subDS(ox, fromInt(ix)), ly = subDS(oy, fromInt(iy)), lz = subDS(oz, fromInt(iz));
+    DS gradientY = ly;
+    if (ySmear.hi != 0.0 || ySmear.lo != 0.0) {
+        DS selected = !lessDS(yMax, scalar(0.0)) && lessDS(yMax, ly) ? yMax : ly;
+        int steps = floorDS(addDS(mulDS(selected, readDS(record + 2u)), scalar(1.0e-7)));
+        gradientY = subDS(ly, mulDS(fromInt(steps), ySmear));
+    }
+    uint px0 = permutation(record, ix), px1 = permutation(record, ix + 1);
+    uint p00 = permutation(record, int(px0) + iy), p01 = permutation(record, int(px0) + iy + 1);
+    uint p10 = permutation(record, int(px1) + iy), p11 = permutation(record, int(px1) + iy + 1);
+
+    if (params.mode == 1) {
+        float fx = lx.hi, fy = gradientY.hi, fz = lz.hi;
+        float a = gradientFloat(permutation(record, int(p00) + iz), fx, fy, fz);
+        float b = gradientFloat(permutation(record, int(p10) + iz), fx - 1.0, fy, fz);
+        float c = gradientFloat(permutation(record, int(p01) + iz), fx, fy - 1.0, fz);
+        float d = gradientFloat(permutation(record, int(p11) + iz), fx - 1.0, fy - 1.0, fz);
+        float e = gradientFloat(permutation(record, int(p00) + iz + 1), fx, fy, fz - 1.0);
+        float f = gradientFloat(permutation(record, int(p10) + iz + 1), fx - 1.0, fy, fz - 1.0);
+        float g = gradientFloat(permutation(record, int(p01) + iz + 1), fx, fy - 1.0, fz - 1.0);
+        float h = gradientFloat(permutation(record, int(p11) + iz + 1), fx - 1.0, fy - 1.0, fz - 1.0);
+        fx = fadeFloat(fx); fy = fadeFloat(ly.hi); fz = fadeFloat(fz);
+        return scalar(lerpFloat(fz,
+            lerpFloat(fy, lerpFloat(fx,a,b), lerpFloat(fx,c,d)),
+            lerpFloat(fy, lerpFloat(fx,e,f), lerpFloat(fx,g,h))));
+    }
+
+    DS xm = subDS(lx, scalar(1.0)), ym = subDS(gradientY, scalar(1.0)), zm = subDS(lz, scalar(1.0));
+    DS a = gradientDS(permutation(record, int(p00) + iz), lx, gradientY, lz);
+    DS b = gradientDS(permutation(record, int(p10) + iz), xm, gradientY, lz);
+    DS c = gradientDS(permutation(record, int(p01) + iz), lx, ym, lz);
+    DS d = gradientDS(permutation(record, int(p11) + iz), xm, ym, lz);
+    DS e = gradientDS(permutation(record, int(p00) + iz + 1), lx, gradientY, zm);
+    DS f = gradientDS(permutation(record, int(p10) + iz + 1), xm, gradientY, zm);
+    DS g = gradientDS(permutation(record, int(p01) + iz + 1), lx, ym, zm);
+    DS h = gradientDS(permutation(record, int(p11) + iz + 1), xm, ym, zm);
+    DS fx = fadeDS(lx), fy = fadeDS(ly), fz = fadeDS(lz);
+    return lerpDS(fz,
+        lerpDS(fy, lerpDS(fx,a,b), lerpDS(fx,c,d)),
+        lerpDS(fy, lerpDS(fx,e,f), lerpDS(fx,g,h)));
+}
+
+DS improvedNoise(uint record, DS x, DS y, DS z, inout uint latticeHash) {
+    return improvedNoiseSmear(record, x, y, z, scalar(0.0), scalar(0.0), latticeHash);
+}
+
+DS blendedNoise(uint sampleIndex, bool gpuCoordinates, inout uint latticeHash) {
+    uint recordOffset = readWord(4), stride = readWord(5);
+    uint at = readWord(3) + sampleIndex * (gpuCoordinates ? 3u : 12u);
+    DS d0, d1, d2, d3, d4, d5;
+    if (gpuCoordinates) {
+        d0 = mulDS(fromInt(int(readWord(at))), readDS(10u));
+        d1 = mulDS(fromInt(int(readWord(at + 1u))), readDS(12u));
+        d2 = mulDS(fromInt(int(readWord(at + 2u))), readDS(10u));
+        d3 = mulDS(d0, readDS(14u));
+        d4 = mulDS(d1, readDS(16u));
+        d5 = mulDS(d2, readDS(14u));
+    } else {
+        d0 = readDS(at); d1 = readDS(at + 2u); d2 = readDS(at + 4u);
+        d3 = readDS(at + 6u); d4 = readDS(at + 8u); d5 = readDS(at + 10u);
+    }
+    DS d6 = readDS(6u), d7 = readDS(8u);
+    DS mainSum = scalar(0.0), minSum = scalar(0.0), maxSum = scalar(0.0);
+    float inverseAmplitude = 1.0;
+    for (uint i = 0u; i < 8u; i++) {
+        uint record = recordOffset + i * stride;
+        if (readWord(record) != 0u) {
+            DS value = improvedNoiseSmear(record,
+                wrapDS(mulDS(d3, scalar(inverseAmplitude))),
+                wrapDS(mulDS(d4, scalar(inverseAmplitude))),
+                wrapDS(mulDS(d5, scalar(inverseAmplitude))),
+                mulDS(d7, scalar(inverseAmplitude)),
+                mulDS(d4, scalar(inverseAmplitude)), latticeHash);
+            mainSum = addDS(mainSum, mulDS(value, scalar(1.0 / inverseAmplitude)));
+        }
+        inverseAmplitude *= 0.5;
+    }
+    DS fraction = mulDS(addDS(mulDS(mainSum, DS(0.1, -1.4901161e-9)), scalar(1.0)), scalar(0.5));
+    bool atMax = !lessDS(fraction, scalar(1.0)), atMin = !lessDS(scalar(0.0), fraction);
+    inverseAmplitude = 1.0;
+    for (uint i = 0u; i < 16u; i++) {
+        DS x = wrapDS(mulDS(d0, scalar(inverseAmplitude)));
+        DS y = wrapDS(mulDS(d1, scalar(inverseAmplitude)));
+        DS z = wrapDS(mulDS(d2, scalar(inverseAmplitude)));
+        DS smear = mulDS(d6, scalar(inverseAmplitude));
+        DS maxY = mulDS(d1, scalar(inverseAmplitude));
+        uint minRecord = recordOffset + (8u + i) * stride;
+        uint maxRecord = recordOffset + (24u + i) * stride;
+        if (!atMax && readWord(minRecord) != 0u) {
+            DS value = improvedNoiseSmear(minRecord, x, y, z, smear, maxY, latticeHash);
+            minSum = addDS(minSum, mulDS(value, scalar(1.0 / inverseAmplitude)));
+        }
+        if (!atMin && readWord(maxRecord) != 0u) {
+            DS value = improvedNoiseSmear(maxRecord, x, y, z, smear, maxY, latticeHash);
+            maxSum = addDS(maxSum, mulDS(value, scalar(1.0 / inverseAmplitude)));
+        }
+        inverseAmplitude *= 0.5;
+    }
+    DS clamped = maxDS(scalar(0.0), minDS(scalar(1.0), fraction));
+    return mulDS(lerpDS(clamped, mulDS(minSum, scalar(1.0 / 512.0)),
+            mulDS(maxSum, scalar(1.0 / 512.0))), scalar(1.0 / 128.0));
+}
+
+DS perlin(uint firstRecord, uint count, uint stride, DS x, DS y, DS z, inout uint latticeHash) {
+    DS sum = scalar(0.0);
+    for (uint octave = 0u; octave < count; octave++) {
+        uint record = firstRecord + octave * stride;
+        DS frequency = readDS(record);
+        DS scale = readDS(record + 2u);
+        DS value = improvedNoise(record,
+            wrapDS(mulDS(x, frequency)), wrapDS(mulDS(y, frequency)), wrapDS(mulDS(z, frequency)), latticeHash);
+        if (params.mode == 3) sum = addDS(sum, mulDS(scale, value));
+        else sum = scalar(sum.hi + scale.hi * value.hi);
+    }
+    return sum;
+}
+
+DS weirdNoise(uint sampleIndex, inout uint latticeHash, out uint rarityIndexOut) {
+    uint at = readWord(3) + sampleIndex * 5u;
+    DS inputValue = readDS(at + 3u);
+    if (noiseType() == 8) {
+        uint source = readWord(readWord(3) + readWord(0) * 5u) - 1u + sampleIndex * 3u;
+        inputValue = DS(uintBitsToFloat(inputData.words[source]),
+                        uintBitsToFloat(inputData.words[source + 1u]));
+    }
+    uint rarityIndex;
+    float rarity;
+    if (readWord(8) == 2u) {
+        rarityIndex = lessDS(inputValue, scalar(-0.75)) ? 0u
+            : lessDS(inputValue, scalar(-0.5)) ? 1u
+            : lessDS(inputValue, scalar(0.5)) ? 2u
+            : lessDS(inputValue, scalar(0.75)) ? 3u : 4u;
+        rarity = rarityIndex == 0u ? 0.5 : rarityIndex == 1u ? 0.75
+            : rarityIndex == 2u ? 1.0 : rarityIndex == 3u ? 2.0 : 3.0;
+    } else {
+        rarityIndex = lessDS(inputValue, scalar(-0.5)) ? 0u
+            : lessDS(inputValue, scalar(0.0)) ? 1u
+            : lessDS(inputValue, scalar(0.5)) ? 2u : 3u;
+        rarity = rarityIndex == 0u ? 0.75 : rarityIndex == 1u ? 1.0
+            : rarityIndex == 2u ? 1.5 : 2.0;
+    }
+    DS reciprocal = readDS(14u + rarityIndex * 2u);
+    rarityIndexOut = rarityIndex;
+    DS x = mulDS(fromInt(int(readWord(at))), reciprocal);
+    DS y = mulDS(fromInt(int(readWord(at + 1u))), reciprocal);
+    DS z = mulDS(fromInt(int(readWord(at + 2u))), reciprocal);
+    uint firstCount = readWord(1), secondCount = readWord(2);
+    uint recordOffset = readWord(4), stride = readWord(5);
+    DS first = perlin(recordOffset, firstCount, stride, x, y, z, latticeHash);
+    DS factor = readDS(12u);
+    DS second = perlin(recordOffset + firstCount * stride, secondCount, stride,
+        mulDS(x, factor), mulDS(y, factor), mulDS(z, factor), latticeHash);
+    float noise = (first.hi + second.hi) * readDS(6u).hi;
+    return scalar(rarity * abs(noise));
+}
+
+DS coordinateNoise(uint sampleIndex, inout uint latticeHash) {
+    uint at = readWord(3) + sampleIndex * 9u;
+    DS shiftX = readDS(at + 3u), shiftY = readDS(at + 5u), shiftZ = readDS(at + 7u);
+    if (noiseType() == 7) {
+        uint table = readWord(3) + readWord(0) * 9u;
+        uint sourceX = readWord(table), sourceY = readWord(table + 1u), sourceZ = readWord(table + 2u);
+        uint addressX = sourceX - 1u + sampleIndex * 3u;
+        uint addressY = sourceY - 1u + sampleIndex * 3u;
+        uint addressZ = sourceZ - 1u + sampleIndex * 3u;
+        if (sourceX != 0u) shiftX = DS(uintBitsToFloat(inputData.words[addressX]), uintBitsToFloat(inputData.words[addressX + 1u]));
+        if (sourceY != 0u) shiftY = DS(uintBitsToFloat(inputData.words[addressY]), uintBitsToFloat(inputData.words[addressY + 1u]));
+        if (sourceZ != 0u) shiftZ = DS(uintBitsToFloat(inputData.words[addressZ]), uintBitsToFloat(inputData.words[addressZ + 1u]));
+    }
+    DS x = addDS(mulDS(fromInt(int(readWord(at))), readDS(8u)), shiftX);
+    DS y = addDS(mulDS(fromInt(int(readWord(at + 1u))), readDS(10u)), shiftY);
+    DS z = addDS(mulDS(fromInt(int(readWord(at + 2u))), readDS(8u)), shiftZ);
+    uint firstCount = readWord(1), secondCount = readWord(2);
+    uint recordOffset = readWord(4), stride = readWord(5);
+    DS first = perlin(recordOffset, firstCount, stride, x, y, z, latticeHash);
+    DS factor = readDS(12u);
+    DS second = perlin(recordOffset + firstCount * stride, secondCount, stride,
+        mulDS(x, factor), mulDS(y, factor), mulDS(z, factor), latticeHash);
+    return scalar((first.hi + second.hi) * readDS(6u).hi);
+}
+
+void main() {
+    if (params.unused2 == -1) {
+        uint table = params.count + gl_WorkGroupID.y * 4u;
+        jobInputBase = inputData.words[table];
+        jobOutputBase = inputData.words[table + 1u];
+        jobNoiseType = int(inputData.words[table + 2u]);
+    } else {
+        jobInputBase = params.unused2 == 0 ? 0u : params.count;
+        jobOutputBase = params.unused2 == 0 ? 0u : uint(params.unused2 - 1);
+        jobNoiseType = params.unused1;
+    }
+    uint sampleIndex = gl_GlobalInvocationID.x;
+    if (sampleIndex >= readWord(0)) return;
+    int type = noiseType();
+    if (type == 9) {
+        DS result = endIslandValue(sampleIndex);
+        for (uint y = 0u; y < readWord(1u); y++) {
+            uint at = outputBase() + (sampleIndex * readWord(1u) + y) * 3u;
+            outputData.values[at] = floatBitsToUint(result.hi);
+            outputData.values[at + 1u] = floatBitsToUint(result.lo);
+            outputData.values[at + 2u] = 0u;
+        }
+        return;
+    }
+    if (type == 3 || type == 8) {
+        uint hash = 2166136261u;
+        uint rarityIndex;
+        DS result = weirdNoise(sampleIndex, hash, rarityIndex);
+        outputData.values[outputBase() + sampleIndex * 3u] = floatBitsToUint(result.hi);
+        outputData.values[outputBase() + sampleIndex * 3u + 1u] = floatBitsToUint(result.lo);
+        outputData.values[outputBase() + sampleIndex * 3u + 2u] = rarityIndex;
+        return;
+    }
+    if (type == 4 || type == 5 || type == 7) {
+        uint hash = 2166136261u;
+        DS result = coordinateNoise(sampleIndex, hash);
+        if (type == 5) result = scalar(result.hi * 4.0);
+        outputData.values[outputBase() + sampleIndex * 3u] = floatBitsToUint(result.hi);
+        outputData.values[outputBase() + sampleIndex * 3u + 1u] = floatBitsToUint(result.lo);
+        outputData.values[outputBase() + sampleIndex * 3u + 2u] = hash;
+        return;
+    }
+    if (type == 2 || type == 6) {
+        uint hash = 2166136261u;
+        DS result = blendedNoise(sampleIndex, type == 6, hash);
+        outputData.values[outputBase() + sampleIndex * 3u] = floatBitsToUint(result.hi);
+        outputData.values[outputBase() + sampleIndex * 3u + 1u] = floatBitsToUint(result.lo);
+        outputData.values[outputBase() + sampleIndex * 3u + 2u] = hash;
+        return;
+    }
+    uint firstCount = readWord(1), secondCount = readWord(2);
+    bool rawCoordinates = type != 0;
+    uint sampleOffset = readWord(3) + sampleIndex * (rawCoordinates ? 6u : 3u);
+    uint recordOffset = readWord(4), stride = readWord(5);
+    DS x = rawCoordinates ? readDS(sampleOffset)
+        : mulDS(fromInt(int(readWord(sampleOffset))), readDS(8u));
+    DS y = rawCoordinates ? readDS(sampleOffset + 2u)
+        : mulDS(fromInt(int(readWord(sampleOffset + 1u))), readDS(10u));
+    DS z = rawCoordinates ? readDS(sampleOffset + 4u)
+        : mulDS(fromInt(int(readWord(sampleOffset + 2u))), readDS(8u));
+    DS factor = readDS(12u);
+    uint latticeHash = 2166136261u;
+    DS first = perlin(recordOffset, firstCount, stride, x, y, z, latticeHash);
+    DS second = perlin(recordOffset + firstCount * stride, secondCount, stride,
+        mulDS(x, factor), mulDS(y, factor), mulDS(z, factor), latticeHash);
+    DS result = params.mode == 3 ? mulDS(addDS(first, second), readDS(6u))
+        : scalar((first.hi + second.hi) * readDS(6u).hi);
+    outputData.values[outputBase() + sampleIndex * 3u] = floatBitsToUint(result.hi);
+    outputData.values[outputBase() + sampleIndex * 3u + 1u] = floatBitsToUint(result.lo);
+    outputData.values[outputBase() + sampleIndex * 3u + 2u] = latticeHash;
+}

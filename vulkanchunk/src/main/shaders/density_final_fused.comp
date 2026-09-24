@@ -1,0 +1,124 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer { uint words[]; } inputData;
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuffer { uint values[]; } outputData;
+layout(push_constant) uniform Parameters { uint count; int unused0; int unused1; int unused2; } params;
+
+struct DS { float hi; float lo; };
+DS scalar(float x) { return DS(x, 0.0); }
+DS readDS(uint at) { return DS(uintBitsToFloat(inputData.words[at]), uintBitsToFloat(inputData.words[at + 1u])); }
+DS negate(DS x) { return DS(-x.hi, -x.lo); }
+DS addDS(DS a, DS b) {
+    precise float sum = a.hi + b.hi;
+    precise float back = sum - a.hi;
+    precise float error = (a.hi - (sum - back)) + (b.hi - back);
+    precise float tail = (error + a.lo) + b.lo;
+    precise float hi = sum + tail;
+    precise float lo = tail - (hi - sum);
+    return DS(hi, lo);
+}
+DS subDS(DS a, DS b) { return addDS(a, negate(b)); }
+DS mulDS(DS a, DS b) {
+    precise float product = a.hi * b.hi;
+    precise float splitA = 4097.0 * a.hi;
+    precise float largeA = splitA - (splitA - a.hi);
+    precise float smallA = a.hi - largeA;
+    precise float splitB = 4097.0 * b.hi;
+    precise float largeB = splitB - (splitB - b.hi);
+    precise float smallB = b.hi - largeB;
+    precise float error = ((largeA * largeB - product) + largeA * smallB)
+                        + smallA * largeB + smallA * smallB;
+    precise float tail = ((error + (a.hi * b.lo + a.lo * b.hi)) + a.lo * b.lo);
+    precise float hi = product + tail;
+    precise float lo = tail - (hi - product);
+    return DS(hi, lo);
+}
+bool lessDS(DS a, DS b) { return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo); }
+DS minDS(DS a, DS b) {
+    if (isnan(a.hi) || isnan(a.lo) || isnan(b.hi) || isnan(b.lo)) return scalar(uintBitsToFloat(0x7fc00000u));
+    return lessDS(a, b) ? a : b;
+}
+DS maxDS(DS a, DS b) {
+    if (isnan(a.hi) || isnan(a.lo) || isnan(b.hi) || isnan(b.lo)) return scalar(uintBitsToFloat(0x7fc00000u));
+    return lessDS(a, b) ? b : a;
+}
+DS lerpDS(DS t, DS a, DS b) { return addDS(a, mulDS(t, subDS(b, a))); }
+
+DS corner(uint leaf, uint chunk, uint cx, uint cz, uint cy, uint horizontal, uint vertical) {
+    uint cornerCount = inputData.words[2];
+    uint acrossChunks = inputData.words[0] * cornerCount;
+    uint index = (cx * horizontal + cz) * vertical + cy;
+    uint at = inputData.words[6] + (leaf * acrossChunks + chunk * cornerCount + index) * 3u;
+    return readDS(at);
+}
+
+DS interpolate(uint leaf, uint chunk, uint x, uint y, uint z) {
+    uint width = inputData.words[3], cellHeight = inputData.words[4], height = inputData.words[5];
+    uint cx = x / width, cz = z / width, cy = y / cellHeight;
+    DS fx = scalar(float(x % width) / float(width));
+    DS fz = scalar(float(z % width) / float(width));
+    DS fy = scalar(float(y % cellHeight) / float(cellHeight));
+    uint horizontal = 16u / width + 1u, vertical = height / cellHeight + 1u;
+    DS z00 = lerpDS(fy, corner(leaf, chunk, cx, cz, cy, horizontal, vertical), corner(leaf, chunk, cx, cz, cy + 1u, horizontal, vertical));
+    DS z10 = lerpDS(fy, corner(leaf, chunk, cx + 1u, cz, cy, horizontal, vertical), corner(leaf, chunk, cx + 1u, cz, cy + 1u, horizontal, vertical));
+    DS z01 = lerpDS(fy, corner(leaf, chunk, cx, cz + 1u, cy, horizontal, vertical), corner(leaf, chunk, cx, cz + 1u, cy + 1u, horizontal, vertical));
+    DS z11 = lerpDS(fy, corner(leaf, chunk, cx + 1u, cz + 1u, cy, horizontal, vertical), corner(leaf, chunk, cx + 1u, cz + 1u, cy + 1u, horizontal, vertical));
+    return lerpDS(fz, lerpDS(fx, z00, z10), lerpDS(fx, z01, z11));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint blocksPerChunk = inputData.words[1];
+    if (i >= inputData.words[0] * blocksPerChunk) return;
+    uint chunk = i / blocksPerChunk, local = i % blocksPerChunk;
+    uint x = local % 16u, z = (local / 16u) % 16u, y = local / 256u;
+    DS leaves[6];
+    uint interpolators = inputData.words[10] - 1u;
+    for (uint leaf = 0u; leaf < interpolators; leaf++) leaves[leaf] = interpolate(leaf, chunk, x, y, z);
+    leaves[interpolators] = readDS(inputData.words[7] + i * 2u);
+    DS stack[256];
+    uint branchHash = 2166136261u;
+    uint nodeBase = inputData.words[8], count = inputData.words[9];
+    for (uint n = 0u; n < count; n++) {
+        uint base = nodeBase + n * 10u;
+        uint op = inputData.words[base];
+        uint ai = inputData.words[base + 1u], bi = inputData.words[base + 2u];
+        uint ci = inputData.words[base + 3u];
+        DS p = readDS(base + 5u), q = readDS(base + 7u);
+        DS a = op == 0u ? leaves[ai] : (op == 1u ? p : stack[ai]);
+        DS b = op >= 2u && op <= 5u ? stack[bi] : (op == 15u ? stack[bi] : scalar(0.0));
+        DS result = a;
+        if (op == 2u) result = addDS(a, b);
+        else if (op == 3u) result = a.hi == 0.0 && a.lo == 0.0 ? scalar(0.0) : mulDS(a, b);
+        else if (op == 4u) result = minDS(a, b);
+        else if (op == 5u) result = maxDS(a, b);
+        else if (op == 6u) result = addDS(a, p);
+        else if (op == 7u) result = mulDS(a, p);
+        else if (op == 8u) result = lessDS(a, scalar(0.0)) ? negate(a) : a;
+        else if (op == 9u) result = mulDS(a, a);
+        else if (op == 10u) result = mulDS(mulDS(a, a), a);
+        else if (op == 11u) result = lessDS(scalar(0.0), a) ? a : mulDS(a, scalar(0.5));
+        else if (op == 12u) result = lessDS(scalar(0.0), a) ? a : mulDS(a, scalar(0.25));
+        else if (op == 13u) {
+            DS d = maxDS(scalar(-1.0), minDS(scalar(1.0), a));
+            result = subDS(mulDS(d, scalar(0.5)), mulDS(mulDS(mulDS(d, d), d), scalar(1.0 / 24.0)));
+        } else if (op == 14u) result = maxDS(p, minDS(q, a));
+        else if (op == 15u) {
+            bool inside = !lessDS(a, p) && lessDS(a, q);
+            if (params.unused0 == 0) branchHash = (branchHash ^ uint(inside)) * 16777619u;
+            result = inside ? b : stack[ci];
+        } else if (op == 16u) {
+            DS inverse = DS(uintBitsToFloat(inputData.words[base + 4u]),
+                            uintBitsToFloat(inputData.words[base + 9u]));
+            DS t = maxDS(scalar(0.0), minDS(scalar(1.0),
+                    mulDS(subDS(a, scalar(float(int(bi)))), inverse)));
+            result = addDS(p, mulDS(t, subDS(q, p)));
+        }
+        stack[n] = result;
+    }
+    DS value = stack[count - 1u];
+    outputData.values[i * 3u] = floatBitsToUint(value.hi);
+    outputData.values[i * 3u + 1u] = floatBitsToUint(value.lo);
+    outputData.values[i * 3u + 2u] = params.unused0 == 0 ? branchHash : 0u;
+}

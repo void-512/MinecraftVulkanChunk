@@ -1,0 +1,141 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer { uint words[]; } inputData;
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuffer { uint values[]; } outputData;
+layout(push_constant) uniform Parameters { uint count; int mode; int unused1; int unused2; } params;
+
+struct DS { float hi; float lo; };
+DS scalar(float value) { return DS(value, 0.0); }
+uint inputBase() { return params.mode >= 3
+    ? inputData.words[uint(params.unused1) + gl_WorkGroupID.y * 4u]
+    : uint(params.unused1); }
+uint outputBase() { return params.mode >= 3
+    ? inputData.words[uint(params.unused1) + gl_WorkGroupID.y * 4u + 1u]
+    : uint(params.unused2); }
+DS readDS(uint offset) { return DS(uintBitsToFloat(inputData.words[inputBase() + offset]), uintBitsToFloat(inputData.words[inputBase() + offset + 1u])); }
+DS negate(DS value) { return DS(-value.hi, -value.lo); }
+DS addDS(DS a, DS b) {
+    precise float sum = a.hi + b.hi;
+    precise float back = sum - a.hi;
+    precise float error = (a.hi - (sum - back)) + (b.hi - back);
+    precise float tail = (error + a.lo) + b.lo;
+    precise float hi = sum + tail;
+    precise float lo = tail - (hi - sum);
+    return DS(hi, lo);
+}
+DS subDS(DS a, DS b) { return addDS(a, negate(b)); }
+DS mulDS(DS a, DS b) {
+    precise float product = a.hi * b.hi;
+    precise float splitA = 4097.0 * a.hi;
+    precise float largeA = splitA - (splitA - a.hi);
+    precise float smallA = a.hi - largeA;
+    precise float splitB = 4097.0 * b.hi;
+    precise float largeB = splitB - (splitB - b.hi);
+    precise float smallB = b.hi - largeB;
+    precise float error = ((largeA * largeB - product) + largeA * smallB)
+                        + smallA * largeB + smallA * smallB;
+    precise float tail = ((error + (a.hi * b.lo + a.lo * b.hi)) + a.lo * b.lo);
+    precise float hi = product + tail;
+    precise float lo = tail - (hi - product);
+    return DS(hi, lo);
+}
+bool lessDS(DS a, DS b) { return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo); }
+DS minDS(DS a, DS b) {
+    if (isnan(a.hi) || isnan(a.lo) || isnan(b.hi) || isnan(b.lo)) return scalar(uintBitsToFloat(0x7fc00000u));
+    return lessDS(a, b) ? a : b;
+}
+DS maxDS(DS a, DS b) {
+    if (isnan(a.hi) || isnan(a.lo) || isnan(b.hi) || isnan(b.lo)) return scalar(uintBitsToFloat(0x7fc00000u));
+    return lessDS(a, b) ? b : a;
+}
+
+void main() {
+    uint sampleIndex = gl_GlobalInvocationID.x;
+    uint baseAddress = inputBase();
+    if (sampleIndex >= inputData.words[baseAddress]) return;
+    uint count = inputData.words[baseAddress + 1u];
+    uint leafCount = inputData.words[baseAddress + 2u];
+    uint nodeOffset = inputData.words[baseAddress + 3u];
+    uint firstSample = inputData.words[baseAddress + 4u];
+    uint sampleOffset = firstSample + sampleIndex * leafCount * 2u;
+    uint sourceTable = baseAddress + firstSample + inputData.words[baseAddress] * leafCount * 2u;
+    DS stack[256];
+    uint branchHash = 2166136261u;
+    for (uint i = 0u; i < count; i++) {
+        uint base = nodeOffset + i * 10u;
+        uint op = inputData.words[baseAddress + base];
+        uint ai = inputData.words[baseAddress + base + 1u], bi = inputData.words[baseAddress + base + 2u];
+        uint ci = inputData.words[baseAddress + base + 3u];
+        DS p = readDS(base + 5u), q = readDS(base + 7u);
+        DS a;
+        if (op == 0u && params.mode >= 3) {
+            uint source = inputData.words[sourceTable + ai * 2u];
+            if (source != 0u) {
+                uint address = source - 1u + sampleIndex * inputData.words[sourceTable + ai * 2u + 1u];
+                a = DS(uintBitsToFloat(inputData.words[address]), uintBitsToFloat(inputData.words[address + 1u]));
+            } else a = readDS(sampleOffset + ai * 2u);
+        } else a = op == 0u ? readDS(sampleOffset + ai * 2u) : (op == 1u ? p : stack[ai]);
+        DS b = op >= 2u && op <= 5u ? stack[bi] : (op == 15u ? stack[bi] : scalar(0.0));
+        DS result = a;
+        if (params.mode == 0) {
+            float x = a.hi, y = b.hi, lo = p.hi, hi = q.hi;
+            if (op == 2u) result = scalar(x + y);
+            else if (op == 3u) result = scalar(x == 0.0 ? 0.0 : x * y);
+            else if (op == 4u) result = scalar(min(x, y));
+            else if (op == 5u) result = scalar(max(x, y));
+            else if (op == 6u) result = scalar(x + lo);
+            else if (op == 7u) result = scalar(x * lo);
+            else if (op == 8u) result = scalar(abs(x));
+            else if (op == 9u) result = scalar(x * x);
+            else if (op == 10u) result = scalar(x * x * x);
+            else if (op == 11u) result = scalar(x > 0.0 ? x : x * 0.5);
+            else if (op == 12u) result = scalar(x > 0.0 ? x : x * 0.25);
+            else if (op == 13u) { float d = clamp(x, -1.0, 1.0); result = scalar(d * 0.5 - d * d * d / 24.0); }
+            else if (op == 14u) result = scalar(clamp(x, lo, hi));
+            else if (op == 15u) {
+                bool inside = x >= lo && x < hi;
+                if (params.mode != 4) branchHash = (branchHash ^ uint(inside)) * 16777619u;
+                result = inside ? b : stack[ci];
+            }
+            else if (op == 16u) {
+                float t = clamp((x - float(int(bi))) / float(int(ci) - int(bi)), 0.0, 1.0);
+                result = scalar(lo + t * (hi - lo));
+            }
+        } else {
+            if (op == 2u) result = addDS(a, b);
+            else if (op == 3u) result = a.hi == 0.0 && a.lo == 0.0 ? scalar(0.0) : mulDS(a, b);
+            else if (op == 4u) result = minDS(a, b);
+            else if (op == 5u) result = maxDS(a, b);
+            else if (op == 6u) result = addDS(a, p);
+            else if (op == 7u) result = mulDS(a, p);
+            else if (op == 8u) result = lessDS(a, scalar(0.0)) ? negate(a) : a;
+            else if (op == 9u) result = mulDS(a, a);
+            else if (op == 10u) result = mulDS(mulDS(a, a), a);
+            else if (op == 11u) result = lessDS(scalar(0.0), a) ? a : mulDS(a, scalar(0.5));
+            else if (op == 12u) result = lessDS(scalar(0.0), a) ? a : mulDS(a, scalar(0.25));
+            else if (op == 13u) {
+                DS d = maxDS(scalar(-1.0), minDS(scalar(1.0), a));
+                result = subDS(mulDS(d, scalar(0.5)), mulDS(mulDS(mulDS(d, d), d), scalar(1.0 / 24.0)));
+            } else if (op == 14u) result = maxDS(p, minDS(q, a));
+            else if (op == 15u) {
+                bool inside = !lessDS(a, p) && lessDS(a, q);
+                if (params.mode != 4) branchHash = (branchHash ^ uint(inside)) * 16777619u;
+                result = inside ? b : stack[ci];
+            }
+            else if (op == 16u) {
+                DS inverse = DS(uintBitsToFloat(inputData.words[baseAddress + base + 4u]),
+                                uintBitsToFloat(inputData.words[baseAddress + base + 9u]));
+                DS t = maxDS(scalar(0.0), minDS(scalar(1.0),
+                        mulDS(subDS(a, scalar(float(int(bi)))), inverse)));
+                result = addDS(p, mulDS(t, subDS(q, p)));
+            }
+        }
+        stack[i] = result;
+    }
+    DS outputValue = stack[count - 1u];
+    uint target = outputBase() + sampleIndex * 3u;
+    outputData.values[target] = floatBitsToUint(outputValue.hi);
+    outputData.values[target + 1u] = floatBitsToUint(outputValue.lo);
+    outputData.values[target + 2u] = params.mode == 4 ? 0u : branchHash;
+}

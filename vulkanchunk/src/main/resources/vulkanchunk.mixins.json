@@ -1,0 +1,18 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.vulkanchunk.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "ImprovedNoiseAccessor",
+    "NormalNoiseAccessor",
+    "NoiseBasedChunkGeneratorMixin",
+    "NoiseBasedChunkGeneratorAccessor",
+    "NoiseChunkProductionMixin",
+    "NoiseChunkAccessor",
+    "PerlinNoiseAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
