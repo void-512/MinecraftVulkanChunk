@@ -43,6 +43,8 @@ neoForge {
 configurations {
     lwjglBundle
     implementation.extendsFrom lwjglBundle
+    // ModDevGradle launches from classes instead of the shaded production JAR.
+    additionalRuntimeClasspath.extendsFrom lwjglBundle
 }
 
 dependencies {

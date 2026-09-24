@@ -20,8 +20,11 @@ import net.minecraft.world.level.levelgen.blending.Blender;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLongArray;
 
 /** Supplies final density to the existing NoiseChunk material rule during a real noise fill. */
 public final class ProductionDensity {
@@ -31,6 +34,12 @@ public final class ProductionDensity {
     private static volatile VanillaPlanSignatures SIGNATURES;
     private static final Map<NoiseGeneratorSettings, Optional<Plan>> PLAN_CACHE = new IdentityHashMap<>();
     private static final AtomicLong USED_CHUNKS = new AtomicLong();
+    private static final ConcurrentHashMap<String, AtomicLong> NOISE_FILLS = new ConcurrentHashMap<>();
+    private static final boolean MEASURE_FILL = Boolean.getBoolean("vulkanchunk.measureFill");
+    private static final ThreadLocal<Long> FILL_START = new ThreadLocal<>();
+    private static final ThreadLocal<Long> POST_START = new ThreadLocal<>();
+    private static final ConcurrentHashMap<String, FillTiming> FILL_TIMINGS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, AtomicLongArray> BEGIN_PHASES = new ConcurrentHashMap<>();
     private static final AtomicInteger VALIDATE_REMAINING = new AtomicInteger(
             Integer.getInteger("vulkanchunk.validateChunks", 0));
     private static final org.slf4j.Logger LOGGER = com.mojang.logging.LogUtils.getLogger();
@@ -60,10 +69,15 @@ public final class ProductionDensity {
     public static void begin(NoiseBasedChunkGenerator generator, Blender blender,
                              StructureManager structures, RandomState state, ChunkAccess chunk,
                              int minCellY, int cellCountY) {
+        if (MEASURE_FILL) FILL_START.set(System.nanoTime());
         ACTIVE.remove();
-        if (!VulkanChunkService.active()) return;
+        if (!VulkanChunkService.active()) {
+            SchedulingTrace.discarded(chunk);
+            return;
+        }
         String dimension;
         synchronized (DIMENSIONS) { dimension = DIMENSIONS.getOrDefault(state, "unknown dimension"); }
+        SchedulingTrace.started(chunk, dimension);
         var settings = ((NoiseBasedChunkGeneratorAccessor)(Object)generator).vulkanchunk$settings().value();
         if (SIGNATURES == null) {
             VulkanChunkService.unsupported(dimension, "world graph registry is still initializing");
@@ -74,7 +88,9 @@ public final class ProductionDensity {
                     + " has unvalidated fill behavior");
             return;
         }
+        long mark = MEASURE_FILL ? System.nanoTime() : 0;
         Plan plan = matchingPlan(settings);
+        phase(dimension, 0, mark);
         if (plan == null) {
             VulkanChunkService.unsupported(dimension, graphReason(state, settings));
             return;
@@ -84,6 +100,7 @@ public final class ProductionDensity {
             return;
         }
         try {
+            mark = MEASURE_FILL ? System.nanoTime() : 0;
             NoiseChunk noise = chunk.getOrCreateNoiseChunk(source ->
                     ((NoiseBasedChunkGeneratorAccessor)(Object)generator)
                             .vulkanchunk$createNoiseChunk(source, structures, blender, state));
@@ -91,6 +108,8 @@ public final class ProductionDensity {
             synchronized (GRAPHS) {
                 graphs = GRAPHS.computeIfAbsent(state, key -> compileGraphs(key, noise));
             }
+            phase(dimension, 1, mark);
+            mark = MEASURE_FILL ? System.nanoTime() : 0;
             int cellWidth = settings.noiseSettings().getCellWidth();
             int cellHeight = settings.noiseSettings().getCellHeight();
             int minY = minCellY * cellHeight;
@@ -111,7 +130,11 @@ public final class ProductionDensity {
             }
             StagedDensityBatch.Case request = new StagedDensityBatch.Case(graphs.outer(), graphs.inner(),
                     beard, cellWidth, cellHeight, height, chunk.getPos(), minY);
+            SchedulingTrace.created();
+            phase(dimension, 2, mark);
+            mark = MEASURE_FILL ? System.nanoTime() : 0;
             double[] density = VulkanChunkService.submit(request, dimension);
+            phase(dimension, 3, mark);
             if (density != null) {
                 ACTIVE.set(new Active(noise, minY, height, chunk.getPos().getMinBlockX(),
                         chunk.getPos().getMinBlockZ(), density, beardNonzero));
@@ -122,6 +145,15 @@ public final class ProductionDensity {
         } catch (Throwable failure) {
             VulkanChunkService.failed(failure);
         }
+    }
+
+    private static void phase(String dimension, int index, long start) {
+        if (MEASURE_FILL) BEGIN_PHASES.computeIfAbsent(dimension, key -> new AtomicLongArray(5))
+                .addAndGet(index, System.nanoTime() - start);
+    }
+
+    public static void afterBegin() {
+        if (MEASURE_FILL) POST_START.set(System.nanoTime());
     }
 
     private static Plan matchingPlan(NoiseGeneratorSettings settings) {
@@ -168,6 +200,19 @@ public final class ProductionDensity {
 
     public static void end(NoiseBasedChunkGenerator generator, Blender blender,
                            StructureManager structures, RandomState state, ChunkAccess chunk) {
+        SchedulingTrace.ended();
+        if (MEASURE_FILL) {
+            String dimension;
+            synchronized (DIMENSIONS) { dimension = DIMENSIONS.getOrDefault(state, "unknown dimension"); }
+            NOISE_FILLS.computeIfAbsent(dimension, key -> new AtomicLong()).incrementAndGet();
+            Long start = FILL_START.get();
+            FILL_START.remove();
+            if (start != null) FILL_TIMINGS.computeIfAbsent(dimension, key -> new FillTiming())
+                    .record(start, System.nanoTime());
+            Long postStart = POST_START.get();
+            POST_START.remove();
+            if (postStart != null) phase(dimension, 4, postStart);
+        }
         Active active = ACTIVE.get();
         if (active != null && active.used) USED_CHUNKS.incrementAndGet();
         ACTIVE.remove();
@@ -178,6 +223,30 @@ public final class ProductionDensity {
     }
 
     public static long usedChunks() { return USED_CHUNKS.get(); }
+
+    public static Map<String, Long> noiseFills() {
+        Map<String, Long> counts = new TreeMap<>();
+        NOISE_FILLS.forEach((dimension, count) -> counts.put(dimension, count.get()));
+        return counts;
+    }
+
+    public static Map<String, String> fillTimings() {
+        Map<String, String> timings = new TreeMap<>();
+        FILL_TIMINGS.forEach((dimension, timing) -> timings.put(dimension,
+                "count=" + timing.count.get() + " span ns="
+                        + (timing.lastEnd.get() - timing.firstStart.get())
+                        + " sum ns=" + timing.sumNanos.get()));
+        return timings;
+    }
+
+    public static Map<String, String> beginPhases() {
+        Map<String, String> timings = new TreeMap<>();
+        BEGIN_PHASES.forEach((dimension, phases) -> timings.put(dimension,
+                "plan=" + phases.get(0) + " noise=" + phases.get(1)
+                        + " beard=" + phases.get(2) + " submitWait=" + phases.get(3)
+                        + " minecraftAfter=" + phases.get(4)));
+        return timings;
+    }
 
     private static void validateActualChunk(NoiseBasedChunkGenerator generator, Blender blender,
                                             StructureManager structures, RandomState state, ChunkAccess chunk,
@@ -250,6 +319,11 @@ public final class ProductionDensity {
         StagedDensityBatch.clearStaticPrograms();
         BlendedNoiseBatch.clearCache();
         EndIslandBatch.clearCache();
+        NOISE_FILLS.clear();
+        FILL_TIMINGS.clear();
+        BEGIN_PHASES.clear();
+        FILL_START.remove();
+        POST_START.remove();
         ACTIVE.remove();
     }
 
@@ -258,6 +332,20 @@ public final class ProductionDensity {
     }
 
     private record Graphs(DensityGraphProgram outer, DensityGraphProgram[] inner) {}
+
+    private static final class FillTiming {
+        final AtomicLong count = new AtomicLong();
+        final AtomicLong firstStart = new AtomicLong(Long.MAX_VALUE);
+        final AtomicLong lastEnd = new AtomicLong(Long.MIN_VALUE);
+        final AtomicLong sumNanos = new AtomicLong();
+
+        void record(long start, long end) {
+            firstStart.accumulateAndGet(start, Math::min);
+            lastEnd.accumulateAndGet(end, Math::max);
+            sumNanos.addAndGet(end - start);
+            count.incrementAndGet();
+        }
+    }
 
     private static final class Active {
         final NoiseChunk noise;
