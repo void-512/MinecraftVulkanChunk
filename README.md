@@ -1,3 +1,7 @@
+# Cannot reach expected performance due to high kernel launching cost and lack of continuous workload to cover the latency.
+
+---
+
 # Vulkan Chunk research workspace
 
 This repository contains `vulkanchunk`, a NeoForge 1.21.1 mod that uses Vulkan compute for selected chunk terrain density calculations. The mod source, build instructions, platform notes, and license are in [vulkanchunk](vulkanchunk/README.md).
